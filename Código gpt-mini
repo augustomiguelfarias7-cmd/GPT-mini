@@ -1,0 +1,140 @@
+# train_gpt_mini.py
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from datasets import load_dataset, concatenate_datasets
+from transformers import PreTrainedModel, PretrainedConfig
+import json
+import os
+
+# ==== Tokenizer simples PT-BR ====
+class SimpleTokenizer:
+    def __init__(self, vocab=None):
+        if vocab:
+            self.vocab = vocab
+        else:
+            # vocabulário mínimo para teste; expandir para real
+            self.vocab = {"[PAD]":0, "[UNK]":1, "[CLS]":2, "[SEP]":3, "[MASK]":4}
+        self.vocab_size = len(self.vocab)
+    
+    def encode(self, text):
+        return [self.vocab.get(tok, self.vocab["[UNK]"]) for tok in text.split()]
+    
+    def decode(self, ids):
+        inv_vocab = {v:k for k,v in self.vocab.items()}
+        return " ".join([inv_vocab.get(i,"[UNK]") for i in ids])
+
+# ==== Transformer Block ====
+class TransformerBlock(nn.Module):
+    def __init__(self, embed_size, heads, ff_hidden):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(embed_dim=embed_size, num_heads=heads, batch_first=True)
+        self.norm1 = nn.LayerNorm(embed_size)
+        self.ff = nn.Sequential(
+            nn.Linear(embed_size, ff_hidden),
+            nn.ReLU(),
+            nn.Linear(ff_hidden, embed_size)
+        )
+        self.norm2 = nn.LayerNorm(embed_size)
+    
+    def forward(self, x):
+        attn_out,_ = self.attn(x,x,x)
+        x = self.norm1(x + attn_out)
+        x = self.norm2(x + self.ff(x))
+        return x
+
+# ==== GPT-Mini Transformer (Transformers-ready) ====
+class GPTMiniConfig(PretrainedConfig):
+    model_type = "gpt-mini"
+    def __init__(self, vocab_size=16000, n_embd=512, n_layer=6, n_head=8, max_len=128, **kwargs):
+        super().__init__(**kwargs)
+        self.vocab_size = vocab_size
+        self.n_embd = n_embd
+        self.n_layer = n_layer
+        self.n_head = n_head
+        self.max_len = max_len
+
+class GPTMiniForCausalLM(PreTrainedModel):
+    config_class = GPTMiniConfig
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.token_emb = nn.Embedding(config.vocab_size, config.n_embd)
+        self.pos_emb = nn.Embedding(config.max_len, config.n_embd)
+        self.layers = nn.ModuleList([TransformerBlock(config.n_embd, config.n_head, config.n_embd*4)
+                                     for _ in range(config.n_layer)])
+        self.ln_f = nn.LayerNorm(config.n_embd)
+        self.head = nn.Linear(config.n_embd, config.vocab_size)
+
+    def forward(self, input_ids):
+        B,T = input_ids.shape
+        pos = torch.arange(T, device=input_ids.device).unsqueeze(0)
+        x = self.token_emb(input_ids) + self.pos_emb(pos)
+        for layer in self.layers:
+            x = layer(x)
+        x = self.ln_f(x)
+        return self.head(x)
+
+# ==== Carrega datasets PT-BR 100% ====
+def load_datasets(tokenizer, max_len=128):
+    wiki = load_dataset("wikipedia","20220301.pt", split="train")
+    oscar = load_dataset("oscar","unshuffled_deduplicated_pt", split="train")
+    qa = load_dataset("cais/mmlu-pt", split="train")
+    code = load_dataset("bigcode/the-stack-dedup", data_dir="data/python", split="train")
+
+    def tokenize_fn(examples):
+        text_col = "text" if "text" in examples else list(examples.keys())[0]
+        texts = examples[text_col]
+        input_ids = [tokenizer.encode(t)[:max_len] for t in texts]
+        return {"input_ids": input_ids}
+
+    wiki = wiki.map(tokenize_fn, batched=True, remove_columns=wiki.column_names)
+    oscar = oscar.map(tokenize_fn, batched=True, remove_columns=oscar.column_names)
+    qa = qa.map(tokenize_fn, batched=True, remove_columns=qa.column_names)
+    code = code.map(tokenize_fn, batched=True, remove_columns=code.column_names)
+
+    dataset = concatenate_datasets([wiki, oscar, qa, code])
+    return dataset
+
+# ==== Treino ====
+def train():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    tokenizer = SimpleTokenizer()
+    dataset = load_datasets(tokenizer)
+    dataloader = DataLoader(dataset, batch_size=8, shuffle=True)
+
+    config = GPTMiniConfig(vocab_size=tokenizer.vocab_size)
+    model = GPTMiniForCausalLM(config).to(device)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+    criterion = nn.CrossEntropyLoss()
+
+    for epoch in range(5):
+        total_loss = 0
+        for batch in dataloader:
+            input_ids = torch.tensor(batch["input_ids"], dtype=torch.long).to(device)
+            labels = input_ids.clone()
+
+            outputs = model(input_ids)
+            logits = outputs.view(-1, tokenizer.vocab_size)
+            loss = criterion(logits, labels.view(-1))
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+
+        print(f"📘 Epoch {epoch+1} - Avg Loss: {total_loss/len(dataloader):.4f}")
+
+    # Salva em formato Transformers-ready com nome GPT-Mini
+    save_dir = "./GPT-Mini"
+    os.makedirs(save_dir, exist_ok=True)
+    model.save_pretrained(save_dir)
+    tokenizer_path = os.path.join(save_dir, "tokenizer.json")
+    with open(tokenizer_path, "w") as f:
+        json.dump(tokenizer.vocab, f)
+
+    print("✅ GPT-Mini treinado e salvo pronto para Transformers!")
+
+if __name__ == "__main__":
+    train()
